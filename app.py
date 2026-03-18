@@ -23,10 +23,6 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 _processed_ids = set()
 _processing_lock = threading.Lock()
 
-# Store the latest pageToken for changes API
-_changes_page_token = None
-_page_token_lock = threading.Lock()
-
 
 def get_drive_service():
     creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
@@ -107,9 +103,9 @@ def get_existing_mp3_names(service, voicemp3_folder_id):
 
 
 def get_start_page_token(service):
+    # Note: getStartPageToken only accepts supportsAllDrives, not includeItemsFromAllDrives
     resp = service.changes().getStartPageToken(
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
+        supportsAllDrives=True
     ).execute()
     return resp.get('startPageToken')
 
@@ -205,7 +201,7 @@ def watch():
 
 @app.route('/get-page-token', methods=['GET'])
 def get_page_token_endpoint():
-    """Returns current startPageToken for changes API - used by Apps Script to register watch."""
+    """Returns current startPageToken for changes API."""
     try:
         service = get_drive_service()
         token = get_start_page_token(service)
