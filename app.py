@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
-
 _processed_ids = set()
 _processing_lock = threading.Lock()
+
+# Store the latest pageToken for changes API
+_changes_page_token = None
+_page_token_lock = threading.Lock()
 
 
 def get_drive_service():
@@ -103,7 +106,15 @@ def get_existing_mp3_names(service, voicemp3_folder_id):
     return {os.path.splitext(f['name'])[0] for f in files}
 
 
-def register_drive_watch(service, folder_id, webhook_url, channel_id=None):
+def get_start_page_token(service):
+    resp = service.changes().getStartPageToken(
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
+    return resp.get('startPageToken')
+
+
+def register_changes_watch(service, webhook_url, page_token, channel_id=None):
     if not channel_id:
         channel_id = str(uuid.uuid4())
     expiration_ms = int(
@@ -115,12 +126,13 @@ def register_drive_watch(service, folder_id, webhook_url, channel_id=None):
         'address': webhook_url,
         'expiration': expiration_ms
     }
-    response = service.files().watch(
-        fileId=folder_id,
+    response = service.changes().watch(
+        pageToken=page_token,
         body=body,
-        supportsAllDrives=True
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
-    logger.info(f'Drive watch registered: {response}')
+    logger.info(f'Changes watch registered: {response}')
     return response
 
 
@@ -132,12 +144,10 @@ def process_new_files_in_background(call_folder_id, voicemp3_folder_id):
             m4a_files = list_files_in_folder(service, call_folder_id, name_suffix='.m4a')
             existing_mp3s = get_existing_mp3_names(service, voicemp3_folder_id)
             logger.info(f'[WATCH] Found {len(m4a_files)} .m4a files, {len(existing_mp3s)} already converted.')
-
             for f in m4a_files:
                 file_id = f['id']
                 file_name = f['name']
                 base_name = os.path.splitext(file_name)[0]
-
                 if file_id in _processed_ids:
                     logger.info(f'[SKIP-MEM] {file_name} already in memory cache.')
                     continue
@@ -145,18 +155,15 @@ def process_new_files_in_background(call_folder_id, voicemp3_folder_id):
                     logger.info(f'[SKIP-DRIVE] {file_name} already converted in Voicemp3.')
                     _processed_ids.add(file_id)
                     continue
-
                 logger.info(f'[CONVERT] Starting conversion: {file_name} (id={file_id})')
                 try:
                     with tempfile.TemporaryDirectory() as tmpdir:
                         m4a_path = os.path.join(tmpdir, file_name)
                         mp3_name = base_name + '.mp3'
                         mp3_path = os.path.join(tmpdir, mp3_name)
-
                         download_file(service, file_id, m4a_path)
                         convert_m4a_to_mp3(m4a_path, mp3_path)
                         result = upload_file(service, mp3_path, mp3_name, voicemp3_folder_id)
-
                         _processed_ids.add(file_id)
                         existing_mp3s.add(base_name)
                         logger.info(f'[OK] {file_name} -> {result["name"]} (drive_id={result["id"]})')
@@ -174,7 +181,8 @@ def health():
 @app.route('/watch', methods=['POST'])
 def watch():
     resource_state = request.headers.get('X-Goog-Resource-State', '')
-    logger.info(f'[WATCH] Received notification: state={resource_state}')
+    changed = request.headers.get('X-Goog-Changed', '')
+    logger.info(f'[WATCH] Received notification: state={resource_state}, changed={changed}')
 
     if resource_state == 'sync':
         return '', 200
@@ -195,19 +203,33 @@ def watch():
     return '', 200
 
 
+@app.route('/get-page-token', methods=['GET'])
+def get_page_token_endpoint():
+    """Returns current startPageToken for changes API - used by Apps Script to register watch."""
+    try:
+        service = get_drive_service()
+        token = get_start_page_token(service)
+        return jsonify({'pageToken': token}), 200
+    except Exception as e:
+        logger.error(f'[PAGE-TOKEN] Error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/register-watch', methods=['POST'])
 def register_watch_endpoint():
     data = request.get_json(force=True) or {}
-    folder_id = data.get('folder_id') or os.environ.get('CALL_RECORDINGS_FOLDER_ID')
     webhook_url = data.get('webhook_url')
+    page_token = data.get('page_token')
 
-    if not folder_id or not webhook_url:
-        return jsonify({'error': 'folder_id and webhook_url required'}), 400
+    if not webhook_url:
+        return jsonify({'error': 'webhook_url required'}), 400
 
     try:
         service = get_drive_service()
-        response = register_drive_watch(service, folder_id, webhook_url)
-        return jsonify({'status': 'registered', 'channel': response}), 200
+        if not page_token:
+            page_token = get_start_page_token(service)
+        response = register_changes_watch(service, webhook_url, page_token)
+        return jsonify({'status': 'registered', 'channel': response, 'pageToken': page_token}), 200
     except Exception as e:
         logger.error(f'[REGISTER-WATCH] Error: {e}')
         return jsonify({'error': str(e)}), 500
@@ -217,10 +239,8 @@ def register_watch_endpoint():
 def sync_all():
     call_folder_id = os.environ.get('CALL_RECORDINGS_FOLDER_ID')
     voicemp3_folder_id = os.environ.get('VOICEMP3_FOLDER_ID')
-
     if not call_folder_id or not voicemp3_folder_id:
         return jsonify({'error': 'Missing CALL_RECORDINGS_FOLDER_ID or VOICEMP3_FOLDER_ID'}), 500
-
     t = threading.Thread(
         target=process_new_files_in_background,
         args=(call_folder_id, voicemp3_folder_id),
@@ -235,32 +255,24 @@ def convert():
     data = request.get_json(force=True)
     if not data:
         return jsonify({'error': 'Request body must be JSON'}), 400
-
     file_id = data.get('file_id')
     file_name = data.get('file_name', 'output.m4a')
     target_folder_id = data.get('target_folder_id')
-
     if not file_id or not target_folder_id:
         return jsonify({'error': 'file_id and target_folder_id are required'}), 400
-
     base_name = os.path.splitext(file_name)[0]
     mp3_name = base_name + '.mp3'
-
     try:
         service = get_drive_service()
         with tempfile.TemporaryDirectory() as tmpdir:
             m4a_path = os.path.join(tmpdir, file_name)
             mp3_path = os.path.join(tmpdir, mp3_name)
-
             logger.info(f'Downloading file_id={file_id} name={file_name}')
             download_file(service, file_id, m4a_path)
-
             logger.info(f'Converting {file_name} -> {mp3_name}')
             convert_m4a_to_mp3(m4a_path, mp3_path)
-
             logger.info(f'Uploading {mp3_name} to folder {target_folder_id}')
             result = upload_file(service, mp3_path, mp3_name, target_folder_id)
-
             _processed_ids.add(file_id)
             return jsonify({
                 'status': 'success',
