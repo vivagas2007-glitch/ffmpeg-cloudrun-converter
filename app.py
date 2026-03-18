@@ -3,12 +3,16 @@ import json
 import tempfile
 import subprocess
 import logging
+import threading
+import uuid
+import datetime
 from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 import io
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,6 +20,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
+
+# In-memory set of already processed file IDs (resets on restart, but
+# we also check Voicemp3 folder to avoid duplicates after restart)
+_processed_ids = set()
+_processing_lock = threading.Lock()
 
 
 def get_drive_service():
@@ -70,23 +79,188 @@ def upload_file(service, file_path, file_name, folder_id):
     return uploaded
 
 
+def list_files_in_folder(service, folder_id, name_suffix=None):
+    """List all files in a Drive folder."""
+    results = []
+    page_token = None
+    query = f"'{folder_id}' in parents and trashed=false"
+    while True:
+        resp = service.files().list(
+            q=query,
+            fields='nextPageToken, files(id, name, createdTime)',
+            pageToken=page_token,
+            pageSize=1000,
+            orderBy='createdTime desc'
+        ).execute()
+        files = resp.get('files', [])
+        if name_suffix:
+            files = [f for f in files if f['name'].lower().endswith(name_suffix)]
+        results.extend(files)
+        page_token = resp.get('nextPageToken')
+        if not page_token:
+            break
+    return results
+
+
+def get_existing_mp3_names(service, voicemp3_folder_id):
+    """Return a set of MP3 base names already present in Voicemp3."""
+    files = list_files_in_folder(service, voicemp3_folder_id, name_suffix='.mp3')
+    return {os.path.splitext(f['name'])[0] for f in files}
+
+
+def register_drive_watch(service, folder_id, webhook_url, channel_id=None):
+    """Register a Google Drive push notification channel on a folder."""
+    if not channel_id:
+        channel_id = str(uuid.uuid4())
+    # Expiration: 7 days from now in milliseconds
+    expiration_ms = int(
+        (datetime.datetime.utcnow() + datetime.timedelta(days=7)).timestamp() * 1000
+    )
+    body = {
+        'id': channel_id,
+        'type': 'web_hook',
+        'address': webhook_url,
+        'expiration': expiration_ms
+    }
+    response = service.files().watch(
+        fileId=folder_id,
+        body=body
+    ).execute()
+    logger.info(f'Drive watch registered: {response}')
+    return response
+
+
+def process_new_files_in_background(call_folder_id, voicemp3_folder_id):
+    """Check for new .m4a files and convert any that haven't been processed yet."""
+    with _processing_lock:
+        try:
+            service = get_drive_service()
+            logger.info('[WATCH] Scanning CallRecordings for new .m4a files...')
+            m4a_files = list_files_in_folder(service, call_folder_id, name_suffix='.m4a')
+            existing_mp3s = get_existing_mp3_names(service, voicemp3_folder_id)
+            logger.info(f'[WATCH] Found {len(m4a_files)} .m4a files, {len(existing_mp3s)} already converted.')
+
+            for f in m4a_files:
+                file_id = f['id']
+                file_name = f['name']
+                base_name = os.path.splitext(file_name)[0]
+                expected_mp3_base = base_name
+
+                if file_id in _processed_ids:
+                    logger.info(f'[SKIP-MEM] {file_name} already in memory cache.')
+                    continue
+                if expected_mp3_base in existing_mp3s:
+                    logger.info(f'[SKIP-DRIVE] {file_name} already converted in Voicemp3.')
+                    _processed_ids.add(file_id)
+                    continue
+
+                logger.info(f'[CONVERT] Starting conversion: {file_name} (id={file_id})')
+                try:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        m4a_path = os.path.join(tmpdir, file_name)
+                        mp3_name = base_name + '.mp3'
+                        mp3_path = os.path.join(tmpdir, mp3_name)
+
+                        download_file(service, file_id, m4a_path)
+                        convert_m4a_to_mp3(m4a_path, mp3_path)
+                        result = upload_file(service, mp3_path, mp3_name, voicemp3_folder_id)
+
+                        _processed_ids.add(file_id)
+                        existing_mp3s.add(expected_mp3_base)
+                        logger.info(f'[OK] {file_name} -> {result["name"]} (drive_id={result["id"]})')
+                except Exception as e:
+                    logger.error(f'[FAIL] {file_name}: {e}')
+        except Exception as e:
+            logger.error(f'[WATCH] Background processing error: {e}')
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Liveness check endpoint."""
     return jsonify({'status': 'ok', 'service': 'ffmpeg-cloudrun-converter'}), 200
 
 
+@app.route('/watch', methods=['POST'])
+def watch():
+    """
+    Google Drive Push Notification webhook.
+    Google sends POST here when CallRecordings folder changes.
+    We respond immediately with 200, then process files in background thread.
+    """
+    # Validate it's a real Drive notification
+    resource_state = request.headers.get('X-Goog-Resource-State', '')
+    logger.info(f'[WATCH] Received notification: state={resource_state}')
+
+    # 'sync' is just a channel registration confirmation, ignore it
+    if resource_state == 'sync':
+        return '', 200
+
+    call_folder_id = os.environ.get('CALL_RECORDINGS_FOLDER_ID')
+    voicemp3_folder_id = os.environ.get('VOICEMP3_FOLDER_ID')
+
+    if not call_folder_id or not voicemp3_folder_id:
+        logger.error('[WATCH] Missing CALL_RECORDINGS_FOLDER_ID or VOICEMP3_FOLDER_ID env vars')
+        return jsonify({'error': 'Missing folder env vars'}), 500
+
+    # Respond immediately to Drive (must be within 10 seconds)
+    t = threading.Thread(
+        target=process_new_files_in_background,
+        args=(call_folder_id, voicemp3_folder_id),
+        daemon=True
+    )
+    t.start()
+
+    return '', 200
+
+
+@app.route('/register-watch', methods=['POST'])
+def register_watch_endpoint():
+    """
+    One-time call to register Google Drive Push Notification.
+    POST body: { "folder_id": "...", "webhook_url": "https://..." }
+    """
+    data = request.get_json(force=True) or {}
+    folder_id = data.get('folder_id') or os.environ.get('CALL_RECORDINGS_FOLDER_ID')
+    webhook_url = data.get('webhook_url')
+
+    if not folder_id or not webhook_url:
+        return jsonify({'error': 'folder_id and webhook_url required'}), 400
+
+    try:
+        service = get_drive_service()
+        response = register_drive_watch(service, folder_id, webhook_url)
+        return jsonify({'status': 'registered', 'channel': response}), 200
+    except Exception as e:
+        logger.error(f'[REGISTER-WATCH] Error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/sync', methods=['POST'])
+def sync_all():
+    """
+    Manual trigger: scan CallRecordings and convert all new .m4a files.
+    Same logic as watch but called manually.
+    """
+    call_folder_id = os.environ.get('CALL_RECORDINGS_FOLDER_ID')
+    voicemp3_folder_id = os.environ.get('VOICEMP3_FOLDER_ID')
+
+    if not call_folder_id or not voicemp3_folder_id:
+        return jsonify({'error': 'Missing CALL_RECORDINGS_FOLDER_ID or VOICEMP3_FOLDER_ID'}), 500
+
+    t = threading.Thread(
+        target=process_new_files_in_background,
+        args=(call_folder_id, voicemp3_folder_id),
+        daemon=True
+    )
+    t.start()
+    return jsonify({'status': 'sync started in background'}), 200
+
+
 @app.route('/convert', methods=['POST'])
 def convert():
     """
-    Convert a .m4a file from Google Drive to MP3 and upload to target folder.
-
-    Expected JSON body:
-    {
-        "file_id": "<Google Drive file ID of the .m4a file>",
-        "file_name": "<original filename, e.g. call_001.m4a>",
-        "target_folder_id": "<Google Drive folder ID to upload MP3 into>"
-    }
+    Convert a specific .m4a file from Google Drive to MP3.
+    Expected JSON body: { "file_id": "...", "file_name": "...", "target_folder_id": "..." }
     """
     data = request.get_json(force=True)
     if not data:
@@ -99,13 +273,11 @@ def convert():
     if not file_id or not target_folder_id:
         return jsonify({'error': 'file_id and target_folder_id are required'}), 400
 
-    # Derive output MP3 filename
     base_name = os.path.splitext(file_name)[0]
     mp3_name = base_name + '.mp3'
 
     try:
         service = get_drive_service()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             m4a_path = os.path.join(tmpdir, file_name)
             mp3_path = os.path.join(tmpdir, mp3_name)
@@ -119,13 +291,13 @@ def convert():
             logger.info(f'Uploading {mp3_name} to folder {target_folder_id}')
             result = upload_file(service, mp3_path, mp3_name, target_folder_id)
 
-        return jsonify({
-            'status': 'success',
-            'mp3_file_id': result['id'],
-            'mp3_file_name': result['name'],
-            'source_file_id': file_id
-        }), 200
-
+            _processed_ids.add(file_id)
+            return jsonify({
+                'status': 'success',
+                'mp3_file_id': result['id'],
+                'mp3_file_name': result['name'],
+                'source_file_id': file_id
+            }), 200
     except HttpError as e:
         logger.error(f'Google Drive API error: {e}')
         return jsonify({'error': f'Google Drive API error: {str(e)}'}), 500
